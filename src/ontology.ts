@@ -16,6 +16,10 @@ export type Service =
   | "tasks"
   | "photos"
   | "people"
+  | "analytics"
+  | "ads"
+  | "maps"
+  | "meet"
   | "github"
   | "unknown";
 
@@ -33,33 +37,52 @@ const SERVICE_KEYWORDS: Record<Exclude<Service, "github" | "unknown">, string[]>
   tasks: ["task", "tasks", "tasklist", "tasklists", "todo"],
   photos: ["photo", "photos", "album", "albums", "mediaitem", "media"],
   people: ["contact", "contacts", "people", "person", "connection", "connections", "othercontact"],
+  // googlesuper also bundles Analytics, Ads, Maps and Meet; without these rows
+  // ~90 of its tools resolved to "unknown".
+  analytics: ["conversion", "property", "properties", "audience", "audiences", "dimension", "dimensions", "metric", "metrics", "report", "reports", "stream", "streams", "adsense", "bigquery", "dv360", "rollup", "subproperty", "attribution", "signals", "account", "accounts"],
+  ads: ["campaign", "campaigns", "ad", "ads", "bidding", "budget", "budgets", "asset", "assets", "customer", "callout", "mutate", "conversion"],
+  maps: ["geocode", "geocoding", "place", "places", "direction", "directions", "distance", "tile", "nearby", "maps", "map", "aerial", "route", "routes"],
+  meet: ["meet", "conference", "participant", "participants", "space", "spaces", "transcript", "recording"],
 };
 
-export function inferService(toolSlug: string, toolkitSlug: string, description: string): Service {
+export function inferService(toolSlug: string, toolkitSlug: string, description: string, inputNames: string[] = []): Service {
   // toolkit wins outright: a GitHub tool is never reclassified just because its
   // description mentions "file" or "calendar".
   if (toolkitSlug.toLowerCase() === "github") return "github";
   if (toolSlug.toUpperCase().startsWith("GITHUB_")) return "github";
 
-  const slugTokens = tokenize(toolSlug).filter((t) => t !== "googlesuper");
-  const descTokens = tokenize(description);
-  const slugSet = new Set(slugTokens);
-  const descSet = new Set(descTokens);
+  const slugSet = new Set(tokenize(toolSlug).filter((t) => t !== "googlesuper"));
+  const descSet = new Set(tokenize(description));
+
+  // slug tokens decide; description only breaks ties between slug-matched
+  // services, or votes when the slug names no service at all. Weighting slug 2x
+  // was not enough: GOOGLESUPER_SEARCH_PEOPLE has one slug hit ("people") but a
+  // description full of "email"/"message", and was filed under gmail.
+  // entity-qualified id inputs are the strongest evidence of all: a tool taking
+  // spreadsheet_id is a Sheets tool even when its slug says APPEND_DIMENSION
+  // (an Analytics word), and DELETE_REPLY taking file_id is a Drive tool.
+  const paramVotes = new Map<Service, number>();
+  for (const name of inputNames) {
+    const n = normalizeLeaf(name);
+    const def = SLOT_TABLE.find((d) => GOOGLE_SERVICES.has(d.service) && d.service !== "people" && !d.homeOnly && d.patterns.some((re) => re.test(n)));
+    if (def) paramVotes.set(def.service, (paramVotes.get(def.service) ?? 0) + 1);
+  }
 
   let best: Service = "unknown";
-  let bestScore = 0;
+  let bestScore: [number, number] = [0, 0];
   for (const [service, keywords] of Object.entries(SERVICE_KEYWORDS)) {
-    let score = 0;
+    let slugScore = 2 * (paramVotes.get(service as Service) ?? 0);
+    let descScore = 0;
     for (const kw of keywords) {
-      if (slugSet.has(kw)) score += 2;
-      else if (descSet.has(kw)) score += 1;
+      if (slugSet.has(kw)) slugScore++;
+      if (descSet.has(kw)) descScore++;
     }
-    if (score > bestScore) {
-      bestScore = score;
+    if (slugScore > bestScore[0] || (slugScore === bestScore[0] && descScore > bestScore[1])) {
+      bestScore = [slugScore, descScore];
       best = service as Service;
     }
   }
-  return bestScore > 0 ? best : "unknown";
+  return bestScore[0] + bestScore[1] > 0 ? best : "unknown";
 }
 
 function tokenize(s: string): string[] {
@@ -144,6 +167,7 @@ function singularize(w: string): string {
   if (w.length <= 3 || !w.endsWith("s")) return w;
   if (NON_PLURAL_ENDINGS.some((suf) => w.endsWith(suf))) return w; // address, status, analysis, alias
   if (w.endsWith("ies")) return `${w.slice(0, -3)}y`; // properties -> property
+  if (/(sses|uses|xes|ches|shes)$/.test(w)) return w.slice(0, -2); // addresses, statuses, branches
   return w.slice(0, -1);
 }
 
@@ -151,6 +175,9 @@ interface SlotDef {
   slot: string;
   service: Service;
   patterns: RegExp[];
+  // generic names (`parent`, `resource_name`) that only mean this slot inside
+  // its own service; they are skipped by the cross-service fallback tiers.
+  homeOnly?: boolean;
   // entity noun(s) used by the heuristic producer fallback when a tool has no
   // declared outputParameters — matched against slug tokens (singular form;
   // plurals are derived automatically). Pipe-separate genuine synonyms.
@@ -165,11 +192,14 @@ const SLOT_TABLE: SlotDef[] = [
   { slot: "gmail.draft_id", service: "gmail", patterns: [/^draft_id$/], noun: "draft" },
   { slot: "gmail.attachment_id", service: "gmail", patterns: [/^attachment_id$/], noun: "attachment" },
   { slot: "gmail.filter_id", service: "gmail", patterns: [/^filter_id$/], noun: "filter" },
+  { slot: "gmail.send_as_email", service: "gmail", patterns: [/^send_as_email$/], noun: "sendas" },
 
   // ---- drive ----
   { slot: "drive.file_id", service: "drive", patterns: [/^file_id$/, /^drive_file_id$/], noun: "file" },
   { slot: "drive.folder_id", service: "drive", patterns: [/^folder_id$/], noun: "folder" },
-  { slot: "drive.drive_id", service: "drive", patterns: [/^drive_id$/, /^shared_drive_id$/], noun: "drive" },
+  { slot: "drive.drive_id", service: "drive", patterns: [/^drive_id$/, /^shared_drive_id$/, /^team_drive_id$/], noun: "drive" },
+  { slot: "drive.comment_id", service: "drive", patterns: [/^comment_id$/], noun: "comment" },
+  { slot: "drive.reply_id", service: "drive", patterns: [/^reply_id$/], noun: "reply" },
   { slot: "drive.permission_id", service: "drive", patterns: [/^permission_id$/], noun: "permission" },
   { slot: "drive.revision_id", service: "drive", patterns: [/^revision_id$/], noun: "revision" },
 
@@ -181,7 +211,8 @@ const SLOT_TABLE: SlotDef[] = [
   // ---- sheets ----
   { slot: "sheets.spreadsheet_id", service: "sheets", patterns: [/^spreadsheet_id$/], noun: "spreadsheet" },
   { slot: "sheets.sheet_id", service: "sheets", patterns: [/^sheet_id$/, /^gid$/], noun: "sheet" },
-  { slot: "sheets.range", service: "sheets", patterns: [/^range$/, /^a1_range$/, /^cell_range$/], noun: "range" },
+  { slot: "sheets.sheet_name", service: "sheets", patterns: [/^sheet_name$/, /^sheet_title$/], noun: "sheet" },
+  { slot: "sheets.range", service: "sheets", patterns: [/^range$/, /^a1_range$/, /^cell_range$/], noun: "range", homeOnly: true },
 
   // ---- docs / slides / forms ----
   { slot: "docs.document_id", service: "docs", patterns: [/^document_id$/, /^doc_id$/], noun: "document" },
@@ -191,25 +222,37 @@ const SLOT_TABLE: SlotDef[] = [
   { slot: "forms.response_id", service: "forms", patterns: [/^response_id$/], noun: "response" },
 
   // ---- tasks ----
-  { slot: "tasks.tasklist_id", service: "tasks", patterns: [/^tasklist_id$/, /^task_list_id$/], noun: "tasklist" },
+  { slot: "tasks.tasklist_id", service: "tasks", patterns: [/^tasklist_id$/, /^task_list_id$/, /^tasklist$/], noun: "tasklist" },
   { slot: "tasks.task_id", service: "tasks", patterns: [/^task_id$/], noun: "task" },
 
   // ---- photos ----
   { slot: "photos.album_id", service: "photos", patterns: [/^album_id$/], noun: "album" },
-  { slot: "photos.media_item_id", service: "photos", patterns: [/^media_item_id$/], noun: "mediaitem|media" },
+  { slot: "photos.media_item_id", service: "photos", patterns: [/^media_item_id$/], noun: "media_item" },
 
   // ---- people / contacts (cross-service: name -> email resolution) ----
-  { slot: "people.contact_id", service: "people", patterns: [/^contact_id$/, /^person_id$/, /^resource_name$/], noun: "contact" },
+  { slot: "people.contact_id", service: "people", patterns: [/^contact_id$/, /^person_id$/], noun: "contact" },
+  { slot: "people.contact_id", service: "people", patterns: [/^resource_name$/], noun: "contact", homeOnly: true },
   {
     slot: "people.email_address",
     service: "people",
     patterns: [/^email(_address)?$/, /^to$/, /^cc$/, /^bcc$/, /^recipient_email$/, /^to_email$/, /^attendee_email$/],
-    noun: "email",
+    // not "email": GET_PERMISSION_ID_FOR_EMAIL consumes an address, it doesn't find one
+    noun: "contact|people|person",
   },
 
+  // ---- analytics / ads / meet ----
+  // GA admin APIs address everything by resource name ("properties/123"),
+  // passed as `parent` or `property`.
+  { slot: "analytics.property", service: "analytics", patterns: [/^property_id$/, /^parent$/, /^property$/], noun: "property", homeOnly: true },
+  { slot: "analytics.account", service: "analytics", patterns: [/^account_id$/, /^account$/], noun: "account", homeOnly: true },
+  { slot: "ads.customer_id", service: "ads", patterns: [/^customer_id$/], noun: "customer" },
+  { slot: "meet.conference_record_id", service: "meet", patterns: [/^conference_record_id$/, /^conference_record$/], noun: "conference" },
+  { slot: "meet.space_name", service: "meet", patterns: [/^space_name$/, /^space_id$/], noun: "space" },
+
   // ---- github: repo coordinates ----
-  { slot: "github.owner", service: "github", patterns: [/^owner$/, /^org(anization)?$/, /^org_name$/, /^owner_name$/], noun: "owner" },
+  { slot: "github.owner", service: "github", patterns: [/^owner$/, /^org(anization)?$/, /^org_name$/, /^owner_name$/, /^owner_login$/, /^organization_login$/], noun: "owner" },
   { slot: "github.repo", service: "github", patterns: [/^repo(sitory)?$/, /^repo(sitory)?_name$/], noun: "repo|repository" },
+  { slot: "github.repository_id", service: "github", patterns: [/^repo(sitory)?_id$/, /^selected_repository_id$/], noun: "repo|repository" },
   { slot: "github.branch", service: "github", patterns: [/^branch$/, /^branch_name$/, /^ref_branch$/], noun: "branch" },
   { slot: "github.ref", service: "github", patterns: [/^ref$/, /^git_ref$/], noun: "ref" },
   { slot: "github.commit_sha", service: "github", patterns: [/^(commit_)?sha$/, /^commit_id$/, /^commit$/], noun: "commit" },
@@ -221,7 +264,7 @@ const SLOT_TABLE: SlotDef[] = [
   { slot: "github.issue_number", service: "github", patterns: [/^issue_number$/, /^issue_id$/], noun: "issue" },
   { slot: "github.pull_number", service: "github", patterns: [/^pull_number$/, /^pr_number$/, /^pull_request_number$/], noun: "pull|pr" },
   { slot: "github.review_id", service: "github", patterns: [/^review_id$/], noun: "review" },
-  { slot: "github.review_comment_id", service: "github", patterns: [/^review_comment_id$/], noun: "review" },
+  { slot: "github.review_comment_id", service: "github", patterns: [/^review_comment_id$/], noun: "review_comment" },
   { slot: "github.comment_id", service: "github", patterns: [/^comment_id$/], noun: "comment" },
   { slot: "github.discussion_number", service: "github", patterns: [/^discussion_number$/, /^discussion_id$/], noun: "discussion" },
   { slot: "github.milestone_number", service: "github", patterns: [/^milestone_number$/, /^milestone$/, /^milestone_id$/], noun: "milestone" },
@@ -233,8 +276,8 @@ const SLOT_TABLE: SlotDef[] = [
   { slot: "github.run_id", service: "github", patterns: [/^run_id$/, /^workflow_run_id$/], noun: "run" },
   { slot: "github.job_id", service: "github", patterns: [/^job_id$/], noun: "job" },
   { slot: "github.artifact_id", service: "github", patterns: [/^artifact_id$/], noun: "artifact" },
-  { slot: "github.check_run_id", service: "github", patterns: [/^check_run_id$/], noun: "check" },
-  { slot: "github.check_suite_id", service: "github", patterns: [/^check_suite_id$/], noun: "check" },
+  { slot: "github.check_run_id", service: "github", patterns: [/^check_run_id$/], noun: "check_run" },
+  { slot: "github.check_suite_id", service: "github", patterns: [/^check_suite_id$/], noun: "check_suite" },
   { slot: "github.runner_id", service: "github", patterns: [/^runner_id$/], noun: "runner" },
   { slot: "github.environment_name", service: "github", patterns: [/^environment_name$/, /^environment$/], noun: "environment" },
   { slot: "github.deployment_id", service: "github", patterns: [/^deployment_id$/], noun: "deployment" },
@@ -245,6 +288,10 @@ const SLOT_TABLE: SlotDef[] = [
   { slot: "github.release_id", service: "github", patterns: [/^release_id$/], noun: "release" },
   { slot: "github.asset_id", service: "github", patterns: [/^asset_id$/], noun: "asset" },
   { slot: "github.package_name", service: "github", patterns: [/^package_name$/], noun: "package" },
+  { slot: "github.package_version_id", service: "github", patterns: [/^package_version_id$/], noun: "version" },
+  { slot: "github.codespace_name", service: "github", patterns: [/^codespace_name$/], noun: "codespace" },
+  { slot: "github.reaction_id", service: "github", patterns: [/^reaction_id$/], noun: "reaction" },
+  { slot: "github.ruleset_id", service: "github", patterns: [/^ruleset_id$/], noun: "ruleset" },
   { slot: "github.gist_id", service: "github", patterns: [/^gist_id$/], noun: "gist" },
 
   // ---- github: projects ----
@@ -253,7 +300,7 @@ const SLOT_TABLE: SlotDef[] = [
   { slot: "github.card_id", service: "github", patterns: [/^card_id$/], noun: "card" },
 
   // ---- github: org / users / access ----
-  { slot: "github.username", service: "github", patterns: [/^username$/, /^user$/, /^login$/, /^collaborator$/, /^user_id$/], noun: "user" },
+  { slot: "github.username", service: "github", patterns: [/^username$/, /^user$/, /^login$/, /^user_login$/, /^collaborator$/, /^collaborator_login$/, /^assignee_login$/, /^member_login$/, /^user_id$/], noun: "user" },
   { slot: "github.team_slug", service: "github", patterns: [/^team_slug$/, /^team_id$/, /^team$/], noun: "team" },
   { slot: "github.invitation_id", service: "github", patterns: [/^invitation_id$/], noun: "invitation" },
   { slot: "github.installation_id", service: "github", patterns: [/^installation_id$/], noun: "installation" },
@@ -267,6 +314,7 @@ const SLOT_TABLE: SlotDef[] = [
 
 const GOOGLE_SERVICES = new Set<Service>([
   "gmail", "drive", "calendar", "sheets", "docs", "slides", "forms", "tasks", "photos", "people",
+  "analytics", "ads", "maps", "meet",
 ]);
 
 /**
@@ -292,9 +340,76 @@ export function resolveSlot(service: Service, leafName: string): string | null {
 
   for (const inTier of tiers) {
     for (const def of SLOT_TABLE) {
-      if (!inTier(def)) continue;
+      if (!inTier(def) || (def.homeOnly && def.service !== service)) continue;
       if (def.patterns.some((re) => re.test(n))) return def.slot;
     }
+  }
+  return null;
+}
+
+// leaf names that only identify something in combination with their parent:
+// `threads[].id`, `repositories[].name`, `owner.login`, `emailAddresses[].value`.
+const CONTEXTUAL_LEAVES = new Set(["id", "name", "number", "login", "value", "key", "sha", "slug", "email"]);
+// wrapper segments that say nothing about the entity inside them.
+const WRAPPER_SEGMENTS = new Set(["data", "result", "response", "item", "value", "detail", "response_data"]);
+
+export interface OutputSlot {
+  slot: string;
+  // true when the tool returns the entity itself (threads[].id, or GET_EVENT's
+  // top-level data.id), as opposed to an incidental reference to it
+  // (messages[].threadId inside some other tool's response).
+  primary: boolean;
+}
+
+/**
+ * Resolve an *output* leaf. Output schemas name the entity in the path, not the
+ * leaf: LIST_THREADS returns `data.threads[].id`, whose leaf `id` is stoplisted.
+ * For contextual leaves we compose `${parent}_${leaf}` (thread_id) or try the
+ * parent alone (emailAddresses[].value -> email_address). When there is no
+ * meaningful parent (`data.id`) we use the entity noun from the tool's slug.
+ */
+export function resolveOutputSlot(
+  service: Service,
+  path: string,
+  leafName: string,
+  slugNoun: string | null
+): OutputSlot | null {
+  const leaf = normalizeLeaf(leafName);
+  const parents = path
+    .split(".")
+    .slice(0, -1)
+    .map((seg) => normalizeLeaf(seg.replace(/\[\]$/, "")))
+    .filter((seg) => !WRAPPER_SEGMENTS.has(seg));
+  const parent = parents.at(-1) ?? null;
+
+  if (!CONTEXTUAL_LEAVES.has(leaf)) {
+    const direct = resolveSlot(service, leafName);
+    if (!direct) return null;
+    const entity = direct.split(".")[1]!.replace(/_(id|number|name|sha)$/, "");
+    const top = parent ?? slugNoun;
+    return { slot: direct, primary: top !== null && (top === entity || singularize(top) === entity) };
+  }
+
+  const compose = (entity: string): string | null =>
+    resolveSlot(service, `${entity}_${leaf}`) ??
+    (leaf === "value" || leaf === "email" ? resolveSlot(service, entity) : null);
+
+  if (parent) {
+    const slot = compose(parent);
+    if (!slot) return null;
+    // primary when the value belongs to the entity the tool is about: a top-level
+    // list (threads[].id), a parent that *is* the entity (owner.login), or a tool
+    // whose slug names it (GET_CONTACTS' connections[].emailAddresses[].value).
+    // check_runs[].pull_requests[].number or FIND_EVENT's attendees[].email are incidental.
+    const nouns = slotNouns(slot);
+    const names = (w: string | null) => w !== null && nouns.some((n) => w === n || singularize(w) === n);
+    return { slot, primary: parents.length <= 1 || names(parent) || names(slugNoun) };
+  }
+  if (slugNoun) {
+    // two-word entities first: GET_CHECK_RUN's data.id is a check_run_id, not a run_id
+    const words = slugNoun.split("_");
+    const slot = (words.length > 1 ? compose(slugNoun) : null) ?? compose(words.at(-1)!);
+    return slot ? { slot, primary: true } : null;
   }
   return null;
 }
@@ -310,10 +425,17 @@ export function tokenNamesNoun(token: string, noun: string): boolean {
   return token === noun || singularize(token) === noun;
 }
 
+/** Does the entity at the end of these slug tokens name the noun? Handles
+ *  two-word nouns: [list, check, runs] names "check_run", [get, dns, health, check] does not. */
+export function tailNamesNoun(tokens: string[], noun: string): boolean {
+  const width = noun.split("_").length;
+  if (tokens.length < width) return false;
+  return tokenNamesNoun(tokens.slice(-width).join("_"), noun);
+}
+
 /** Slots a tool of this service could plausibly produce — the search space for
- *  the heuristic producer fallback. Mirrors resolveSlot's tiering so a Gmail
- *  tool is never credited as a producer of `github.repo`. */
+ *  the heuristic producer fallback. Own service only: a slug-noun guess is too
+ *  weak to cross services (Docs' CREATE_NAMED_RANGE is not a source of sheets.range). */
 export function slotsForService(service: Service): string[] {
-  if (service === "github") return SLOT_TABLE.filter((d) => d.service === "github").map((d) => d.slot);
-  return SLOT_TABLE.filter((d) => GOOGLE_SERVICES.has(d.service)).map((d) => d.slot);
+  return [...new Set(SLOT_TABLE.filter((d) => d.service === service).map((d) => d.slot))];
 }
